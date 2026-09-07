@@ -4,12 +4,18 @@ This repo holds nothing but **built releases** of Skybox to Skybox: the Windows 
 
 ## Install
 
-Open PowerShell and run:
+**PowerShell:**
 
 ```powershell
 irm https://raw.githubusercontent.com/Mustafahubs/Skybox-to-skybox-public/main/install.ps1 | iex
 ```
 
-This downloads the latest release, verifies its SHA256 checksum, installs it to `Documents\Skybox-to-skybox`, adds Start Menu and Desktop shortcuts, and launches it. Safe to re-run any time to reinstall/force-update — it replaces the previous exe in place; just close the app first if it's currently running.
+**Command Prompt (cmd.exe):**
+
+```cmd
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/Mustafahubs/Skybox-to-skybox-public/main/install.ps1 | iex"
+```
+
+Either way, this downloads the latest release, verifies its SHA256 checksum, installs it to `Documents\Skybox-to-skybox`, adds Start Menu and Desktop shortcuts, and launches it. Safe to re-run any time to reinstall/force-update — it replaces the previous exe in place; just close the app first if it's currently running.
 
 Once installed, the app checks for newer releases on its own each time it launches and offers to update itself in place — you shouldn't normally need to re-run the installer after the first time.
