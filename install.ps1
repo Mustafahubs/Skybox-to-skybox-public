@@ -19,6 +19,28 @@ Run with:
 
 $ErrorActionPreference = "Stop"
 
+# Every step below that can fail (a copied/piped script has no reliable
+# way to guarantee PowerShell's own uncaught-exception output shows up in
+# full when run non-interactively via `-Command "... | iex"` -- it can
+# surface as nothing more than the bare exception message, e.g. just
+# "Access is denied." with zero context) goes through this instead of a
+# raw try/catch, so a failure always prints something a person can act on.
+function Fail([string]$Context, $ErrorRecord) {
+    $detail = $ErrorRecord.Exception.Message
+    Write-Host ""
+    Write-Host "$Context" -ForegroundColor Red
+    Write-Host "  $detail" -ForegroundColor Red
+    if ($detail -match "Access is denied") {
+        Write-Host ""
+        Write-Host "This usually means Windows Defender's Controlled Folder Access is blocking" -ForegroundColor Yellow
+        Write-Host "powershell.exe from writing to Documents/Desktop. Open Windows Security ->" -ForegroundColor Yellow
+        Write-Host "Virus & threat protection -> Manage ransomware protection -> Controlled" -ForegroundColor Yellow
+        Write-Host "folder access, then either turn it off or allow powershell.exe through it," -ForegroundColor Yellow
+        Write-Host "and run this installer again." -ForegroundColor Yellow
+    }
+    exit 1
+}
+
 # Older Windows/PowerShell defaults to a TLS version GitHub's API and CDN
 # reject outright -- force 1.2 so this doesn't fail with a cryptic
 # connection error on those machines.
@@ -35,37 +57,52 @@ $ExePath = Join-Path $InstallDir $ExeName
 $Headers = @{ "User-Agent" = "skybox-to-skybox-installer" }
 
 Write-Host "Checking latest release..." -ForegroundColor Cyan
-$Release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers $Headers
+try {
+    $Release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" -Headers $Headers
+} catch {
+    Fail "Couldn't reach GitHub to check the latest release." $_
+}
 
 $ExeAsset = $Release.assets | Where-Object { $_.name -eq $ExeName }
 $ChecksumAsset = $Release.assets | Where-Object { $_.name -eq "$ExeName.sha256" }
 
 if (-not $ExeAsset) {
-    throw "No '$ExeName' asset found on the latest release ($($Release.tag_name))."
+    Write-Host "No '$ExeName' asset found on the latest release ($($Release.tag_name))." -ForegroundColor Red
+    exit 1
 }
 if (-not $ChecksumAsset) {
-    throw "No checksum file found on the latest release ($($Release.tag_name)) -- refusing to install an unverifiable build."
+    Write-Host "No checksum file found on the latest release ($($Release.tag_name)) -- refusing to install an unverifiable build." -ForegroundColor Red
+    exit 1
 }
 
 Write-Host "Found $($Release.tag_name). Downloading..." -ForegroundColor Cyan
-New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+try {
+    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+} catch {
+    Fail "Couldn't create the install folder '$InstallDir'." $_
+}
 
 # Download to the system temp dir, not straight into $InstallDir -- so a
 # failed checksum never leaves a half-verified file sitting next to (or
 # overwriting) a working previous install.
 $TempExe = Join-Path $env:TEMP "$ExeName.download"
 $TempChecksum = Join-Path $env:TEMP "$ExeName.sha256.download"
-Invoke-WebRequest -Uri $ExeAsset.browser_download_url -OutFile $TempExe -Headers $Headers
-Invoke-WebRequest -Uri $ChecksumAsset.browser_download_url -OutFile $TempChecksum -Headers $Headers
+try {
+    Invoke-WebRequest -Uri $ExeAsset.browser_download_url -OutFile $TempExe -Headers $Headers
+    Invoke-WebRequest -Uri $ChecksumAsset.browser_download_url -OutFile $TempChecksum -Headers $Headers
+} catch {
+    Fail "Couldn't download the release files." $_
+}
 
 Write-Host "Verifying checksum..." -ForegroundColor Cyan
 $Expected = (Get-Content $TempChecksum -Raw).Trim().Split()[0].ToLower()
 $Actual = (Get-FileHash -Path $TempExe -Algorithm SHA256).Hash.ToLower()
-Remove-Item $TempChecksum -Force
+Remove-Item $TempChecksum -Force -ErrorAction SilentlyContinue
 
 if ($Actual -ne $Expected) {
     Remove-Item $TempExe -Force -ErrorAction SilentlyContinue
-    throw "Checksum mismatch -- the downloaded file doesn't match the published release. Aborting install."
+    Write-Host "Checksum mismatch -- the downloaded file doesn't match the published release. Aborting install." -ForegroundColor Red
+    exit 1
 }
 
 # Re-running this script (to reinstall or force-update) means an old copy
@@ -78,7 +115,7 @@ if (Test-Path $ExePath) {
         Remove-Item -Path $ExePath -Force -ErrorAction Stop
     } catch {
         Remove-Item $TempExe -Force -ErrorAction SilentlyContinue
-        throw "Couldn't remove the existing installation at '$ExePath' -- if Skybox to Skybox is currently running, close it and run this installer again. ($($_.Exception.Message))"
+        Fail "Couldn't remove the existing installation at '$ExePath' -- if Skybox to Skybox is currently running, close it and run this installer again." $_
     }
 }
 
@@ -86,24 +123,40 @@ try {
     Move-Item -Path $TempExe -Destination $ExePath -Force
 } catch {
     Remove-Item $TempExe -Force -ErrorAction SilentlyContinue
-    throw "Couldn't install to '$ExePath' -- if Skybox to Skybox is currently running, close it and run this installer again. ($($_.Exception.Message))"
+    Fail "Couldn't install to '$ExePath'." $_
 }
 
 Write-Host "Installed $($Release.tag_name) to $ExePath" -ForegroundColor Green
 
+# Shortcuts are a nice-to-have, not the actual install -- a Controlled
+# Folder Access block on just the Desktop (or Start Menu) shouldn't sink
+# an otherwise-successful install, so this warns instead of exiting.
 function New-AppShortcut([string]$Path) {
-    $Shell = New-Object -ComObject WScript.Shell
-    $Shortcut = $Shell.CreateShortcut($Path)
-    $Shortcut.TargetPath = $ExePath
-    $Shortcut.WorkingDirectory = $InstallDir
-    $Shortcut.IconLocation = $ExePath
-    $Shortcut.Save()
+    try {
+        $Shell = New-Object -ComObject WScript.Shell
+        $Shortcut = $Shell.CreateShortcut($Path)
+        $Shortcut.TargetPath = $ExePath
+        $Shortcut.WorkingDirectory = $InstallDir
+        $Shortcut.IconLocation = $ExePath
+        $Shortcut.Save()
+        return $true
+    } catch {
+        Write-Host "Couldn't create shortcut '$Path': $($_.Exception.Message)" -ForegroundColor Yellow
+        return $false
+    }
 }
 
 $StartMenuPrograms = Join-Path ([Environment]::GetFolderPath("StartMenu")) "Programs"
-New-AppShortcut (Join-Path $StartMenuPrograms "Skybox to Skybox.lnk")
-New-AppShortcut (Join-Path ([Environment]::GetFolderPath("Desktop")) "Skybox to Skybox.lnk")
-Write-Host "Shortcuts created (Start Menu and Desktop)." -ForegroundColor Green
+$startMenuOk = New-AppShortcut (Join-Path $StartMenuPrograms "Skybox to Skybox.lnk")
+$desktopOk = New-AppShortcut (Join-Path ([Environment]::GetFolderPath("Desktop")) "Skybox to Skybox.lnk")
+if ($startMenuOk -or $desktopOk) {
+    Write-Host "Shortcuts created." -ForegroundColor Green
+}
 
 Write-Host "Launching Skybox to Skybox..." -ForegroundColor Cyan
-Start-Process -FilePath $ExePath
+try {
+    Start-Process -FilePath $ExePath
+} catch {
+    Write-Host "Installed successfully, but couldn't launch it automatically: $($_.Exception.Message)" -ForegroundColor Yellow
+    Write-Host "Start it yourself from $ExePath" -ForegroundColor Yellow
+}
